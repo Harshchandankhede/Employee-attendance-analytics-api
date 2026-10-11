@@ -1,0 +1,43 @@
+# Local secrets and config - never committed
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Data dumps
+*.bson
+*.archive
+
+# Local test output
+tests/server.log
+*_out.txt
+*_out.json
+probe_*.py
+debug_*.py
+check_*.py
+
+# The assignment kit: HROne's own documents and sample data. The repository is
+# public and the brief asks us not to publish the problem statement, so these
+# stay on disk for reference only and are never committed.
+PROBLEM_STATEMENT.docx
+openapi.yaml
+DATA_MODEL.md
+sample_data/
+sample_seed.py
+REVIEW_TEMPLATE.md
+DECISIONS_TEMPLATE.md
