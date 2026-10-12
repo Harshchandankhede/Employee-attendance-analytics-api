@@ -7,16 +7,19 @@ Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
 Contract: openapi.yaml (paths, status codes, field names, business rules R1-R10)
 Storage:  DATA_MODEL.md (collections, field types, seeded data)
 """
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import date as date_cls
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
+from re import compile as re_compile
 from typing import Annotated, Any, Optional
 
+from bson import json_util
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Path as PathParam, Query
-from pydantic import BaseModel, Field, StringConstraints
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
@@ -151,6 +154,16 @@ def compute_half_day(work_hours: Optional[float]) -> bool:
 # --------------------------------------------------------------------------- #
 # Calendar (R7, R9)
 # --------------------------------------------------------------------------- #
+MONTH_PATTERN = re_compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+
+def validate_month(month: str) -> str:
+    """Reject a malformed month with 422 instead of letting date parsing raise."""
+    if not MONTH_PATTERN.match(month):
+        raise HTTPException(422, "month must be YYYY-MM")
+    return month
+
+
 def month_bounds(month: str) -> tuple[str, str]:
     """'YYYY-MM' -> the first and last calendar date of that month, inclusive."""
     year, mon = (int(p) for p in month.split("-"))
@@ -455,6 +468,40 @@ def punch_in(body: PunchInIn):
     return record_to_json(doc)
 
 
+def attendance_filter(emp_code: Optional[str] = None,
+                      date_from: Optional[str] = None,
+                      date_to: Optional[str] = None,
+                      status: Optional[str] = None) -> dict[str, Any]:
+    """The filter /attendance applies, shared with the explain endpoint."""
+    q: dict[str, Any] = {}
+    if emp_code:
+        q["emp_code"] = emp_code
+    if date_from or date_to:
+        q["date"] = {}
+        if date_from:
+            q["date"]["$gte"] = date_from
+        if date_to:
+            q["date"]["$lte"] = date_to
+    if status:
+        q["status"] = status
+    return q
+
+
+def attendance_sort_page(page: int, page_size: int) -> dict[str, Any]:
+    """Sort and pagination for /attendance, shared with the explain endpoint."""
+    return {"sort": [("date", DESCENDING), ("emp_code", ASCENDING)],
+            "skip": (page - 1) * page_size, "limit": page_size}
+
+
+def explain_sort(sort: list[tuple[str, int]]) -> dict[str, Any]:
+    """Turn the cursor's sort tuples into the plain document an explain command wants.
+
+    PyMongo's find() accepts tuples, but the explain command is encoded straight
+    to BSON and a tuple is not a BSON document.
+    """
+    return {field: direction for field, direction in sort}
+
+
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
@@ -469,25 +516,15 @@ def list_attendance(
     if status and status not in ALL_STATUSES:
         raise HTTPException(422, "unknown status")
 
-    q: dict[str, Any] = {}
-    if emp_code:
-        q["emp_code"] = emp_code
-    if date_from or date_to:
-        q["date"] = {}
-        if date_from:
-            q["date"]["$gte"] = date_from
-        if date_to:
-            q["date"]["$lte"] = date_to
-    if status:
-        q["status"] = status
-
+    q = attendance_filter(emp_code, date_from, date_to, status)
     total = db.attendance_logs.count_documents(q)
     # Sorted and paginated in the database: the collection is never loaded into memory.
+    paging = attendance_sort_page(page, page_size)
     cursor = (
         db.attendance_logs.find(q)
-        .sort([("date", DESCENDING), ("emp_code", ASCENDING)])
-        .skip((page - 1) * page_size)
-        .limit(page_size)
+        .sort(paging["sort"])
+        .skip(paging["skip"])
+        .limit(paging["limit"])
     )
     return {
         "items": [record_to_json(d) for d in cursor],
@@ -652,18 +689,9 @@ def regularize_attendance(emp_code: str, date: CALENDAR_DATE, body: RegularizeIn
 # --------------------------------------------------------------------------- #
 # Analytics
 # --------------------------------------------------------------------------- #
-@app.get("/analytics/employees/{emp_code}/monthly")
-def employee_monthly(emp_code: str, month: MONTH):
-    emp = db.employees.find_one({"emp_code": emp_code})
-    if not emp:
-        raise HTTPException(404, "employee not found")
-
+def employee_monthly_pipeline(emp_code: str, month: str) -> list[dict]:
     first_day, last_day = month_bounds(month)
-    # R7: weekdays from the join date, so a mid-month joiner is not charged for
-    # days that predate their employment. A calendar count, not a data count.
-    working_days = count_working_days(emp["joined_on"], first_day, last_day)
-
-    pipeline = [
+    return [
         # Narrow first: one employee, one month. This is the stage that uses the
         # (emp_code, date) index.
         {"$match": {"emp_code": emp_code, "date": {"$gte": first_day, "$lte": last_day}}},
@@ -686,7 +714,20 @@ def employee_monthly(emp_code: str, month: MONTH):
         {"$project": {"_id": 0, "present_days": 1, "leave_days": 1, "late_count": 1,
                       "total_late_minutes": 1, "total_overtime_minutes": 1}},
     ]
-    rows = list(db.attendance_logs.aggregate(pipeline))
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: MONTH):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(404, "employee not found")
+
+    first_day, last_day = month_bounds(month)
+    # R7: weekdays from the join date, so a mid-month joiner is not charged for
+    # days that predate their employment. A calendar count, not a data count.
+    working_days = count_working_days(emp["joined_on"], first_day, last_day)
+
+    rows = list(db.attendance_logs.aggregate(employee_monthly_pipeline(emp_code, month)))
     agg = rows[0] if rows else {}
 
     present_days = agg.get("present_days", 0)
@@ -704,10 +745,9 @@ def employee_monthly(emp_code: str, month: MONTH):
     }
 
 
-@app.get("/analytics/departments/summary")
-def department_summary(month: MONTH, department: Optional[str] = None):
+def department_summary_pipeline(month: str, department: Optional[str]) -> list[dict]:
     first_day, last_day = month_bounds(month)
-    emp_match = {"joined_on": {"$lte": last_day}}
+    emp_match: dict[str, Any] = {"joined_on": {"$lte": last_day}}
     if department:
         emp_match["department"] = department
 
@@ -717,7 +757,7 @@ def department_summary(month: MONTH, department: Optional[str] = None):
     # people with no records at all, so this starts from `employees` and joins
     # the logs onto it. The direction matters: joining logs to employees the
     # other way round would be an inner join and would silently drop them.
-    pipeline = [
+    return [
         {"$match": emp_match},
         {"$lookup": {
             "from": "attendance_logs",
@@ -777,8 +817,11 @@ def department_summary(month: MONTH, department: Optional[str] = None):
         {"$sort": {"_id": ASCENDING}},
     ]
 
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: MONTH, department: Optional[str] = None):
     items = []
-    for row in db.employees.aggregate(pipeline):
+    for row in db.employees.aggregate(department_summary_pipeline(month, department)):
         # R8 rounding in Python: $round is half-to-even and would disagree here.
         avg = None
         if row["hours_count"]:
@@ -796,12 +839,8 @@ def department_summary(month: MONTH, department: Optional[str] = None):
     return {"month": month, "items": items}
 
 
-@app.get("/analytics/leaderboard/late")
-def late_leaderboard(
-    month: MONTH,
-    limit: Annotated[int, Query(ge=1, le=50)] = 10,
-    department: Optional[str] = None,
-):
+def late_leaderboard_pipeline(month: str, limit: int,
+                             department: Optional[str]) -> list[dict]:
     first_day, last_day = month_bounds(month)
     emp_match: dict[str, Any] = {}
     if department:
@@ -809,7 +848,7 @@ def late_leaderboard(
         # before ranking, is what makes ranking happen inside that department.
         emp_match["employee.department"] = department
 
-    pipeline = [
+    return [
         {"$match": {"date": {"$gte": first_day, "$lte": last_day},
                     "late_minutes": {"$gt": 0}}},
         {"$group": {
@@ -854,36 +893,21 @@ def late_leaderboard(
         # Row order: total late minutes descending, then emp_code ascending.
         {"$sort": {"total_late_minutes": -1, "emp_code": 1}},
     ]
-    return {"month": month, "items": list(db.attendance_logs.aggregate(pipeline))}
 
 
-@app.get("/analytics/departments/{department}/trend")
-def department_trend(department: str, date_from: str = Query(..., alias="from"),
-                     date_to: str = Query(..., alias="to")):
-    # `from` and `to` are query parameter names; `from` is a Python keyword, so
-    # the parameters are aliased. The values are validated here because FastAPI
-    # cannot apply the pattern to an aliased parameter as declared.
-    for name, value in (("from", date_from), ("to", date_to)):
-        try:
-            date_cls.fromisoformat(value)
-        except ValueError:
-            raise HTTPException(422, f"{name} must be YYYY-MM-DD")
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: MONTH,
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+    department: Optional[str] = None,
+):
+    return {"month": month,
+            "items": list(db.attendance_logs.aggregate(
+                late_leaderboard_pipeline(month, limit, department)))}
 
-    if not db.employees.find_one({"department": department}, {"_id": 1}):
-        raise HTTPException(404, "unknown department")
-    if date_from > date_to:
-        raise HTTPException(422, "to must not be before from")
-    if len(date_range(date_from, date_to)) > 92:
-        raise HTTPException(422, "range must not exceed 92 days")
 
-    # Headcount changes day by day as people join, so each day counts the
-    # employees of this department who had joined by that day (R9).
-    employees = [
-        {"emp_code": e["emp_code"], "joined_on": e["joined_on"]}
-        for e in db.employees.find({"department": department}, {"_id": 0, "emp_code": 1, "joined_on": 1})
-    ]
-
-    pipeline = [
+def department_trend_pipeline(department: str, date_from: str, date_to: str) -> list[dict]:
+    return [
         # Only records belonging to this department, in the range.
         {"$lookup": {
             "from": "employees",
@@ -939,7 +963,35 @@ def department_trend(department: str, date_from: str = Query(..., alias="from"),
         {"$sort": {"day": 1}},
     ]
 
-    rows = list(db.attendance_logs.aggregate(pipeline))
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(department: str, date_from: str = Query(..., alias="from"),
+                     date_to: str = Query(..., alias="to")):
+    # `from` and `to` are query parameter names; `from` is a Python keyword, so
+    # the parameters are aliased. The values are validated here because FastAPI
+    # cannot apply the pattern to an aliased parameter as declared.
+    for name, value in (("from", date_from), ("to", date_to)):
+        try:
+            date_cls.fromisoformat(value)
+        except ValueError:
+            raise HTTPException(422, f"{name} must be YYYY-MM-DD")
+
+    if not db.employees.find_one({"department": department}, {"_id": 1}):
+        raise HTTPException(404, "unknown department")
+    if date_from > date_to:
+        raise HTTPException(422, "to must not be before from")
+    if len(date_range(date_from, date_to)) > 92:
+        raise HTTPException(422, "range must not exceed 92 days")
+
+    # Headcount changes day by day as people join, so each day counts the
+    # employees of this department who had joined by that day (R9).
+    employees = [
+        {"emp_code": e["emp_code"], "joined_on": e["joined_on"]}
+        for e in db.employees.find({"department": department}, {"_id": 0, "emp_code": 1, "joined_on": 1})
+    ]
+
+    rows = list(db.attendance_logs.aggregate(
+        department_trend_pipeline(department, date_from, date_to)))
 
     items = []
     for row in rows:
@@ -977,6 +1029,102 @@ def department_trend(department: str, date_from: str = Query(..., alias="from"),
 
 
 # --------------------------------------------------------------------------- #
-# TODO: the rest of the contract (see openapi.yaml)
-#   GET   /admin/explain/{endpoint}
+# Admin
 # --------------------------------------------------------------------------- #
+EXPLAINABLE = (
+    "attendance_list",
+    "employee_monthly",
+    "department_summary",
+    "late_leaderboard",
+    "department_trend",
+)
+
+
+def explain_plan(namespace, command: dict[str, Any]) -> dict[str, Any]:
+    """Run explain with executionStats and return the raw document as JSON."""
+    result = db.command("explain", command, verbosity="executionStats")
+    # BSON types (ObjectId, dates, Decimal128) are not JSON serialisable, so the
+    # document is walked and converted rather than handed to the encoder.
+    return json.loads(json_util.dumps(result, json_options=json_util.RELAXED_JSON_OPTIONS))
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: str,
+    emp_code: Optional[str] = None,
+    month: Optional[str] = None,
+    department: Optional[str] = None,
+    limit: Annotated[int, Query(ge=1, le=50)] = 10,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    status: Optional[str] = None,
+    date_start: Optional[str] = Query(None, alias="from"),
+    date_end: Optional[str] = Query(None, alias="to"),
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 20,
+):
+    if endpoint not in EXPLAINABLE:
+        raise HTTPException(422, f"endpoint must be one of {', '.join(EXPLAINABLE)}")
+
+    # Every pipeline is built by the same function the real endpoint calls, so
+    # the explained query is the query that actually runs.
+    if endpoint == "attendance_list":
+        if status and status not in ALL_STATUSES:
+            raise HTTPException(422, "unknown status")
+        if date_from and date_to and date_from > date_to:
+            raise HTTPException(422, "date_from must not be after date_to")
+        q = attendance_filter(emp_code, date_from, date_to, status)
+        paging = attendance_sort_page(page, page_size)
+        command = {
+            "find": "attendance_logs",
+            "filter": q,
+            "sort": explain_sort(paging["sort"]),
+            "skip": paging["skip"],
+            "limit": paging["limit"],
+        }
+        return {"endpoint": endpoint, "collection": "attendance_logs",
+                "explain": explain_plan("attendance_logs", command)}
+
+    # The remaining endpoints are all driven by a month, except the trend.
+    if endpoint != "department_trend":
+        if not month:
+            raise HTTPException(422, "month is required")
+        validate_month(month)
+        month_bounds(month)
+
+        if endpoint == "employee_monthly":
+            if not emp_code:
+                raise HTTPException(422, "emp_code is required")
+            pipeline = employee_monthly_pipeline(emp_code, month)
+            collection = "attendance_logs"
+        elif endpoint == "department_summary":
+            pipeline = department_summary_pipeline(month, department)
+            collection = "employees"
+        else:  # late_leaderboard
+            pipeline = late_leaderboard_pipeline(month, limit, department)
+            collection = "attendance_logs"
+
+        return {"endpoint": endpoint, "collection": collection,
+                "explain": explain_plan(
+                    collection,
+                    {"aggregate": collection, "pipeline": pipeline, "cursor": {}})}
+
+    # The trend is driven by from/to, not by a month.
+    if not department:
+        raise HTTPException(422, "department is required")
+    if not date_start or not date_end:
+        raise HTTPException(422, "from and to are required")
+    for name, value in (("from", date_start), ("to", date_end)):
+        try:
+            date_cls.fromisoformat(value)
+        except ValueError:
+            raise HTTPException(422, f"{name} must be YYYY-MM-DD")
+    if date_start > date_end:
+        raise HTTPException(422, "to must not be before from")
+    if len(date_range(date_start, date_end)) > 92:
+        raise HTTPException(422, "range must not exceed 92 days")
+    pipeline = department_trend_pipeline(department, date_start, date_end)
+    return {"endpoint": endpoint, "collection": "attendance_logs",
+            "explain": explain_plan("attendance_logs",
+                                    {"aggregate": "attendance_logs", "pipeline": pipeline,
+                                     "cursor": {}})}

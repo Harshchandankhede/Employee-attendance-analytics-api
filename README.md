@@ -27,14 +27,18 @@ Interactive API docs are at `http://localhost:8000/docs`.
 
 ## Tests
 
-`tests/test_api.py` runs the app as a subprocess and exercises the contract
-against MongoDB. It needs `requests` in addition to `requirements.txt`.
+Two suites, both starting the app as a real subprocess and exercising the
+contract against MongoDB. They need `requests` in addition to `requirements.txt`.
 
 ```bash
-python tests/test_api.py
+python tests/test_api.py         # CRUD, rules R1-R5, pagination, concurrency
+python tests/test_analytics.py   # the four analytics endpoints and explain
 ```
 
-The sample data from the candidate kit is reloaded before and after each run.
+`tests/test_analytics.py` builds the tie cases and the zero-log and mid-month
+joiner cases that the nine sample records cannot show. `test_explain_plan.py`
+seeds ~80,000 records to confirm the plans use index scans, and restores the
+samples afterwards.
 
 ## Design notes
 
@@ -66,6 +70,12 @@ keeps employees with no records in the headcount. The leaderboard ranks with
 ranking, so a tie group at the cutoff is returned in full. The trend uses
 `$densify` to produce one row per calendar day, including weekends and days with
 no records, without a Python loop.
+
+**`/admin/explain/{endpoint}` proves the queries use indexes.** Each of the five
+explainable endpoints has its query built by the same function the real endpoint
+calls, so the explained query is the query that actually runs — there is no second
+copy that can drift. Against a seeded 80,000-record dataset every plan reports
+`IXSCAN` with no `COLLSCAN`.
 
 See `REVIEW.md` for the defects found in the starter code and `DECISIONS.md` for
 the reasoning behind the indexes, the concurrency handling and the tie rules.
