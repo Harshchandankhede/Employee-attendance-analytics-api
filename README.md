@@ -4,6 +4,27 @@ FastAPI + MongoDB backend for HR attendance: punch-in and punch-out with the
 business rules applied, manual corrections with an audit trail, and analytics
 built as MongoDB aggregation pipelines.
 
+**Stack:** Python 3.11+ · FastAPI · PyMongo · MongoDB 6.0+
+
+## API
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/health` | Readiness; 503 when MongoDB does not answer |
+| `POST` | `/employees` | Create an employee (`emp_code` unique at the database level) |
+| `GET` | `/employees` | List by department, sorted by `emp_code`, paginated |
+| `POST` | `/attendance/punch-in` | Open the day's record (R1, R2) |
+| `GET` | `/attendance` | Filter by employee, date range, status; sorted and paginated |
+| `POST` | `/attendance/punch-out` | Close the record (R3–R5), works across midnight |
+| `PATCH` | `/attendance/{emp_code}/{date}` | Manual correction with an audit entry |
+| `GET` | `/analytics/employees/{emp_code}/monthly` | Monthly summary for one employee |
+| `GET` | `/analytics/departments/summary` | Per-department summary for a month |
+| `GET` | `/analytics/leaderboard/late` | Lateness ranking, standard competition ranking |
+| `GET` | `/analytics/departments/{department}/trend` | Daily series with a 7-day moving average |
+| `GET` | `/admin/explain/{endpoint}` | MongoDB query plan for an endpoint's main query |
+
+Business rules R1–R10 are implemented as described in the assignment contract.
+
 ## Running it
 
 Requires Python 3.11+ and MongoDB 6.0 or newer.
@@ -31,16 +52,20 @@ Three suites, all starting the app as a real subprocess and exercising the
 contract against MongoDB. They need `requests` in addition to `requirements.txt`.
 
 ```bash
-python tests/test_api.py         # CRUD, rules R1-R5, pagination, concurrency
-python tests/test_analytics.py   # the four analytics endpoints and explain
+python tests/test_api.py          # CRUD, rules R1-R5, pagination, concurrency
+python tests/test_analytics.py    # the four analytics endpoints and explain
+python tests/test_explain_plan.py  # index usage against ~80,000 seeded records
 ```
 
-`tests/test_analytics.py` builds the tie cases and the zero-log and mid-month
-joiner cases that the nine sample records cannot show. `test_explain_plan.py`
-seeds ~80,000 records to confirm the plans use index scans, and restores the
-samples afterwards.
+The sample data is reloaded before and after every run, so a crashed run cannot
+leak state into the next. `test_analytics.py` builds the tie, zero-log and
+mid-month-joiner cases that the nine sample records cannot show;
+`test_explain_plan.py` seeds roughly 80,000 records because the plan for a
+collection that small tells you nothing about index usage.
 
 ## Design notes
+
+The decisions below were verified against the running service rather than assumed.
 
 **All instants cross the API boundary as epoch milliseconds** and are stored as
 BSON dates. The Mongo client is built with `tz_aware=True`, so every datetime read
@@ -79,3 +104,20 @@ copy that can drift. Against a seeded 80,000-record dataset every plan reports
 
 See `REVIEW.md` for the defects found in the starter code and `DECISIONS.md` for
 the reasoning behind the indexes, the concurrency handling and the tie rules.
+
+## Implementation notes
+
+A few behaviours were verified empirically because the obvious implementation is
+wrong in each case:
+
+- MongoDB's `$round` rounds half to **even**, so `$round(2.5)` is `2` and
+  `$round(1.005, 2)` is `1.0`. Both disagree with the half-up rounding the
+  contract requires, so rounding is done in Python.
+- `$rank` accepts exactly **one** field in `sortBy`; adding a tie-break there
+  splits every tie group and destroys the ranking.
+- `$densify`'s upper bound is **exclusive**, so the range end is passed as
+  `to + 1 day` to include it.
+- `$dayOfWeek` returns `1` for Sunday and `7` for Saturday, so a working day is
+  anything outside `[1, 7]`.
+- Sort clauses accepted by a `find()` cursor are tuples, but an explain command is
+  encoded straight to BSON and needs a plain document.
