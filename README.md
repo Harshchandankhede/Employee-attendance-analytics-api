@@ -27,7 +27,7 @@ Interactive API docs are at `http://localhost:8000/docs`.
 
 ## Tests
 
-Two suites, both starting the app as a real subprocess and exercising the
+Three suites, all starting the app as a real subprocess and exercising the
 contract against MongoDB. They need `requests` in addition to `requirements.txt`.
 
 ```bash
